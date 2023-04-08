@@ -181,8 +181,8 @@ void SetKbdHistoryIndex(DWORD vkKey) {
 		
 		for (auto screen : g_TouchScreens) {
 			ToggleTouchDevice(screen.c_str(), !lock_enabled);
-			SoundEffect(!lock_enabled);
 		}
+		SoundEffect(!lock_enabled);
 	}
 }
 
@@ -231,7 +231,7 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	return 0;
 }
 
-// CheckIfAlreadyRunning is a function that installs a static mutex and checks if it already exists
+// CheckIfAlreadyRunning is a function that installs a global mutex and checks if it already exists
 // if it does, it means that the program is already running and we should exit
 bool CheckIfAlreadyRunning() {
 	HANDLE hMutex = CreateMutex(NULL, TRUE, L"Global\\SAGE_LOCK_INSTANCE");
