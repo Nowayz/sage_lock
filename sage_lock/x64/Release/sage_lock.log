@@ -1,0 +1,6 @@
+﻿  sage_lock.cpp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 144 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  sage_lock.vcxproj -> C:\Users\phil\source\repos\sage_lock\x64\Release\sage_lock.exe
