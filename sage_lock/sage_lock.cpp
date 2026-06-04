@@ -52,8 +52,8 @@ std::wstring GetLastErrorAsWString()
 		return std::wstring(L"No error"); //No error message has been recorded
 	}
 	wchar_t lpBuffer[256];
-	size_t size = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-				NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), lpBuffer, sizeof(lpBuffer), NULL);
+	FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+				NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), lpBuffer, (DWORD)_countof(lpBuffer), NULL);
 	return lpBuffer;
 }
 
@@ -157,11 +157,17 @@ namespace {
 			return;
 		}
 
-		char utf8[8192];
-		int bytes = WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, sizeof(utf8), NULL, NULL);
+		int requiredBytes = WideCharToMultiByte(CP_UTF8, 0, buffer, -1, NULL, 0, NULL, NULL);
+		if (requiredBytes <= 1) {
+			CloseHandle(hLog);
+			return;
+		}
+
+		std::string utf8(requiredBytes, '\0');
+		int bytes = WideCharToMultiByte(CP_UTF8, 0, buffer, -1, &utf8[0], requiredBytes, NULL, NULL);
 		if (bytes > 1) {
 			DWORD written = 0;
-			WriteFile(hLog, utf8, bytes - 1, &written, NULL);
+			WriteFile(hLog, utf8.data(), bytes - 1, &written, NULL);
 		}
 		CloseHandle(hLog);
 #endif
@@ -745,7 +751,7 @@ namespace {
 std::array<DWORD, 4> Volume_Event_History{};
 WORD Current_Index = 0;
 DWORD64 Last_Volume_Event = 0;
-int lock_enabled = 0;
+bool lock_enabled = false;
 std::vector<std::wstring> g_TouchDeviceIds;
 
 // Check Volume_Event_History for UP DOWN UP DOWN events in the last 2 seconds
@@ -896,14 +902,15 @@ void SetKbdHistoryIndex(DWORD vkKey) {
 	Volume_Event_History[i] = vkKey;
 	UpdateSequenceProgress(vkKey);
 	if ((i == 3) && CheckForVolumeUpDownUpDown()) {
-		lock_enabled = !lock_enabled; 
+		lock_enabled = !lock_enabled;
+		const bool enableTouch = !lock_enabled;
 		for (auto screen : g_TouchDeviceIds) {
-			ToggleTouchDevice(screen.c_str(), !lock_enabled);
+			ToggleTouchDevice(screen.c_str(), enableTouch);
 		}
-		SoundEffect(!lock_enabled);
+		SoundEffect(enableTouch);
 		g_VolumePatternStep = 0;
-		ShowSequenceOverlay(4, true, lock_enabled != 0);
-		tracelog(L"Lock sequence completed. lock_enabled=%d\n", lock_enabled);
+		ShowSequenceOverlay(4, true, lock_enabled);
+		tracelog(L"Lock sequence completed. lock_enabled=%d\n", lock_enabled ? 1 : 0);
 	}
 }
 
@@ -1044,16 +1051,27 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 // CheckIfAlreadyRunning is a function that installs a global mutex and checks if it already exists
 // if it does, it means that the program is already running and we should exit
 bool CheckIfAlreadyRunning() {
-	HANDLE hMutex = CreateMutex(NULL, TRUE, L"Global\\SAGE_LOCK_INSTANCE");
+	static HANDLE hMutex = NULL;
+	hMutex = CreateMutex(NULL, TRUE, L"Global\\SAGE_LOCK_INSTANCE");
+	if (!hMutex) {
+		tracelog(L"CreateMutex failed: %s", GetLastErrorAsWString().c_str());
+		return false;
+	}
+
 	if (GetLastError() == ERROR_ALREADY_EXISTS) {
 		CloseHandle(hMutex);
+		hMutex = NULL;
 		return true;
 	}
 	return false;
 }
 
-int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nShowCmd)
 {
+	UNREFERENCED_PARAMETER(hPrevInstance);
+	UNREFERENCED_PARAMETER(lpCmdLine);
+	UNREFERENCED_PARAMETER(nShowCmd);
+
 	g_hInstance = hInstance;
 	tracelog(L"SageLock starting. ExecutableDir=%s\n", GetExecutableDir().c_str());
 
@@ -1068,7 +1086,13 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int n
 	tracelog(L"SageLock startup target enumeration complete.\n");
 
 	HANDLE hInputThread = CreateThread(NULL, NULL, InputEventThread, NULL, NULL, NULL);
+	if (!hInputThread) {
+		tracelog(L"CreateThread failed: %s", GetLastErrorAsWString().c_str());
+		return 1;
+	}
+
 	WaitForSingleObject(hInputThread, INFINITE);
+	CloseHandle(hInputThread);
 	return 0;
 }
 
