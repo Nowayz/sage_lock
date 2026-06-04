@@ -193,15 +193,15 @@
     <ClCompile Include="sage_lock.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <OverlayAsset Include="overlay-step-1.png" />
-    <OverlayAsset Include="overlay-step-2.png" />
-    <OverlayAsset Include="overlay-lock.png" />
-    <OverlayAsset Include="overlay-unlock.png" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="sage_lock.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="sage_lock.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Target Name="CopyOverlayAssets" AfterTargets="Build">
-    <Copy SourceFiles="@(OverlayAsset)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

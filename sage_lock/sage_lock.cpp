@@ -25,6 +25,7 @@
 #include <array>
 #include <cmath>
 #include <gdiplus.h>
+#include "resource.h"
 
 using namespace Gdiplus;
 
@@ -99,11 +100,12 @@ namespace {
 		OverlayBitmapCount = 4
 	};
 
-	std::array<std::wstring, OverlayBitmapCount> g_OverlayImageFiles = {
-		L"overlay-step-1.png",
-		L"overlay-step-2.png",
-		L"overlay-lock.png",
-		L"overlay-unlock.png"
+	std::array<int, OverlayBitmapCount> g_OverlayImageResources = {
+		IDB_OVERLAY_STEP_1,
+		IDB_OVERLAY_STEP_2,
+		IDB_OVERLAY_LOCK,
+		// The PNG itself is intentionally shifted right so the open-lock body aligns with overlay-lock.png.
+		IDB_OVERLAY_UNLOCK
 	};
 	std::array<Bitmap*, OverlayBitmapCount> g_OverlayBitmaps{};
 	int g_VolumePatternStep = 0;
@@ -189,18 +191,61 @@ namespace {
 	}
 
 	void LoadOverlayBitmaps() {
-		const auto exeDir = GetExecutableDir();
-		for (size_t i = 0; i < g_OverlayImageFiles.size(); i++) {
-			auto fullPath = exeDir + L"\\" + g_OverlayImageFiles[i];
-			auto bitmap = Bitmap::FromFile(fullPath.c_str(), false);
+		HINSTANCE module = g_hInstance ? g_hInstance : GetModuleHandleW(NULL);
+		for (size_t i = 0; i < g_OverlayImageResources.size(); i++) {
+			const int resourceId = g_OverlayImageResources[i];
+			HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), L"PNG");
+			if (!resource) {
+				tracelog(L"Could not find overlay image resource: %d\n", resourceId);
+				g_OverlayBitmaps[i] = nullptr;
+				continue;
+			}
+
+			DWORD resourceSize = SizeofResource(module, resource);
+			HGLOBAL loadedResource = LoadResource(module, resource);
+			const void* resourceData = loadedResource ? LockResource(loadedResource) : nullptr;
+			if (!resourceSize || !resourceData) {
+				tracelog(L"Could not load overlay image resource: %d\n", resourceId);
+				g_OverlayBitmaps[i] = nullptr;
+				continue;
+			}
+
+			HGLOBAL imageMemory = GlobalAlloc(GMEM_MOVEABLE, resourceSize);
+			if (!imageMemory) {
+				tracelog(L"Could not allocate overlay image memory: %d\n", resourceId);
+				g_OverlayBitmaps[i] = nullptr;
+				continue;
+			}
+
+			void* imageBuffer = GlobalLock(imageMemory);
+			if (!imageBuffer) {
+				GlobalFree(imageMemory);
+				tracelog(L"Could not lock overlay image memory: %d\n", resourceId);
+				g_OverlayBitmaps[i] = nullptr;
+				continue;
+			}
+
+			memcpy(imageBuffer, resourceData, resourceSize);
+			GlobalUnlock(imageMemory);
+
+			IStream* imageStream = nullptr;
+			if (CreateStreamOnHGlobal(imageMemory, TRUE, &imageStream) != S_OK || !imageStream) {
+				GlobalFree(imageMemory);
+				tracelog(L"Could not create overlay image stream: %d\n", resourceId);
+				g_OverlayBitmaps[i] = nullptr;
+				continue;
+			}
+
+			auto bitmap = Bitmap::FromStream(imageStream, false);
+			imageStream->Release();
 			if (!bitmap || bitmap->GetLastStatus() != Ok) {
-				tracelog(L"Could not load overlay image: %s\n", fullPath.c_str());
+				tracelog(L"Could not decode overlay image resource: %d\n", resourceId);
 				delete bitmap;
 				g_OverlayBitmaps[i] = nullptr;
 			}
 			else {
 				g_OverlayBitmaps[i] = bitmap;
-				tracelog(L"Loaded overlay image: %s\n", fullPath.c_str());
+				tracelog(L"Loaded overlay image resource: %d\n", resourceId);
 			}
 		}
 	}

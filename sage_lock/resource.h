@@ -1,0 +1,7 @@
+#pragma once
+
+#define IDB_OVERLAY_STEP_1 101
+#define IDB_OVERLAY_STEP_2 102
+#define IDB_OVERLAY_LOCK 103
+#define IDB_OVERLAY_UNLOCK 104
+#define IDI_SAGE_LOCK 201

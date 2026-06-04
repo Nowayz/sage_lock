@@ -1,0 +1,8 @@
+#include "resource.h"
+
+IDI_SAGE_LOCK ICON "sage_lock.ico"
+
+IDB_OVERLAY_STEP_1 PNG "overlay-step-1.png"
+IDB_OVERLAY_STEP_2 PNG "overlay-step-2.png"
+IDB_OVERLAY_LOCK PNG "overlay-lock.png"
+IDB_OVERLAY_UNLOCK PNG "overlay-unlock.png"
