@@ -43,9 +43,6 @@ x64/
 # Runtime/debug logs
 sage_lock-debug.log
 
-# Generated icon preview/intermediate images
-sage_lock/sage_lock-*.png
-
 # Keep source assets/resources tracked
 !sage_lock/overlay-*.png
 !sage_lock/*.ico
