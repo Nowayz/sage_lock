@@ -299,13 +299,13 @@ namespace {
 		graphics.DrawString(stepText, -1, &stepFont, textRect, &strFormat, &textBrush);
 	}
 
-	void DrawProgressDots(Graphics& graphics, int activeStep) {
+	void DrawProgressDots(Graphics& graphics, int activeStep, float dotsY = OverlayDotsY) {
 		const int clampedStep = (std::max)(0, (std::min)(activeStep, 4));
 		const float radius = 6.0f;
 		const float gap = 18.0f;
 		const float totalWidth = (radius * 2.0f * 4.0f) + (gap * 3.0f);
 		const float startX = (OverlayWindowSize - totalWidth) * 0.5f;
-		const float y = OverlayDotsY;
+		const float y = dotsY;
 
 		SolidBrush activeBrush(Color(245, 255, 255, 255));
 		SolidBrush inactiveBrush(Color(120, 255, 255, 255));
@@ -319,15 +319,15 @@ namespace {
 		}
 	}
 
-	void DrawFinalStateText(Graphics& graphics, bool locked) {
+	void DrawFinalStateText(Graphics& graphics, bool locked, float labelTop = OverlayLabelTop) {
 		const wchar_t* label = locked ? L"Locked" : L"Unlocked";
 		Font labelFont(L"Segoe UI", locked ? 34.0f : 30.0f, FontStyleBold, UnitPixel);
 		StringFormat strFormat;
 		strFormat.SetAlignment(StringAlignmentCenter);
 		strFormat.SetLineAlignment(StringAlignmentCenter);
 
-		RectF shadowRect(2.0f, OverlayLabelTop + 2.0f, (REAL)OverlayWindowSize, OverlayLabelHeight);
-		RectF textRect(0, OverlayLabelTop, (REAL)OverlayWindowSize, OverlayLabelHeight);
+		RectF shadowRect(2.0f, labelTop + 2.0f, (REAL)OverlayWindowSize, OverlayLabelHeight);
+		RectF textRect(0, labelTop, (REAL)OverlayWindowSize, OverlayLabelHeight);
 		SolidBrush shadowBrush(Color(210, 0, 0, 0));
 		SolidBrush textBrush(Color(255, 255, 255, 255));
 
@@ -364,7 +364,7 @@ namespace {
 		float renderScale = 1.0f;
 		if (g_OverlayState.finalStep) {
 			auto elapsed = (std::max)(0.0f, float(GetTickCount64() - g_OverlayState.finalStart) / 1000.0f);
-			renderScale = 1.0f + 0.12f * std::sin(elapsed * 8.0f);
+			renderScale = 1.0f + 0.05f * std::sin(elapsed * 8.0f);
 		}
 
 		const int imageIndex = g_OverlayState.finalStep ?
@@ -372,6 +372,8 @@ namespace {
 			((g_OverlayState.currentStep % 2) == 1 ? OverlayBitmapVolumeUp : OverlayBitmapVolumeDown);
 		const float hudX = (overlayWindow.width - OverlayWindowSize) * 0.5f;
 		const float hudY = (overlayWindow.height - OverlayWindowSize) * 0.5f;
+		const float finalLabelTop = OverlayLabelTop - 10.0f;
+		const float progressDotsY = OverlayDotsY + (OverlayIconHeight * 1.05f * 0.05f);
 		graphics.TranslateTransform(hudX, hudY);
 
 		if (imageIndex >= 0 && imageIndex < (int)g_OverlayBitmaps.size() && g_OverlayBitmaps[imageIndex]) {
@@ -380,15 +382,16 @@ namespace {
 			const float imgH = (float)image->GetHeight() * renderScale;
 			const float x = (OverlayWindowSize - imgW) * 0.5f;
 			const float y = OverlayIconTop + (OverlayIconHeight - imgH) * 0.5f;
+
 			graphics.DrawImage(image, x, y, imgW, imgH);
 		}
 		else {
 			DrawFallbackStep(graphics, g_OverlayState.currentStep, g_OverlayState.finalStep, renderScale);
 		}
 
-		DrawProgressDots(graphics, g_OverlayState.currentStep);
+		DrawProgressDots(graphics, g_OverlayState.currentStep, progressDotsY);
 		if (g_OverlayState.finalStep) {
-			DrawFinalStateText(graphics, g_OverlayState.finalLocked);
+			DrawFinalStateText(graphics, g_OverlayState.finalLocked, finalLabelTop);
 		}
 
 		graphics.ResetTransform();
