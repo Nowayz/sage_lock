@@ -8,6 +8,8 @@
 #endif
 #include <Windows.h>
 #include <Windowsx.h>
+#include <shellapi.h>
+#include <TlHelp32.h>
 #include <iostream>
 #include <array>
 #include <initguid.h>
@@ -67,6 +69,36 @@ namespace {
 	constexpr DWORD OverlayStepMs = 650;
 	constexpr DWORD OverlayLockMs = 1300;
 	constexpr UINT OverlayTimerId = 1001;
+	constexpr UINT TrayIconId = 1002;
+	constexpr UINT TrayMessageId = WM_APP + 1;
+	constexpr UINT TrayMenuScreenLockModeId = 2002;
+	constexpr UINT TrayMenuKioskModeId = 2003;
+	constexpr UINT TrayMenuCloseId = 2004;
+
+	enum class SageLockMode {
+		ScreenLock,
+		Kiosk
+	};
+
+	struct KioskWindowState {
+		HWND targetWindow = NULL;
+		WINDOWPLACEMENT placement{};
+		bool hadPlacement = false;
+	};
+
+	SageLockMode g_SelectedMode = SageLockMode::ScreenLock;
+	HWND g_MessageWindow = NULL;
+	UINT g_TaskbarCreatedMessage = 0;
+	NOTIFYICONDATAW g_TrayIconData{};
+	bool g_TrayIconAdded = false;
+	bool g_KioskActive = false;
+	KioskWindowState g_KioskWindowState{};
+	bool g_KilledExplorerForKiosk = false;
+	bool g_AutoRestartShellChanged = false;
+	bool g_AutoRestartShellHadOriginalValue = false;
+	DWORD g_AutoRestartShellOriginalValue = 1;
+	bool g_KioskWorkAreaChanged = false;
+	RECT g_OriginalKioskWorkArea{};
 
 	struct OverlayWindowState {
 		bool visible = false;
@@ -122,6 +154,22 @@ namespace {
 	constexpr USHORT HidConsumerControlUsage = 0x0001;
 	constexpr USHORT HidConsumerVolumeIncrement = 0x00E9;
 	constexpr USHORT HidConsumerVolumeDecrement = 0x00EA;
+
+	const wchar_t* GetModeName(SageLockMode mode) {
+		return mode == SageLockMode::Kiosk ? L"Kiosk Mode" : L"Screen Lock Mode";
+	}
+
+	bool NtTerminateProcessHandle(HANDLE process, LONG exitStatus) {
+		using NtTerminateProcessProc = LONG(NTAPI*)(HANDLE ProcessHandle, LONG ExitStatus);
+		static NtTerminateProcessProc ntTerminateProcess =
+			reinterpret_cast<NtTerminateProcessProc>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtTerminateProcess"));
+
+		if (!ntTerminateProcess) {
+			return false;
+		}
+
+		return ntTerminateProcess(process, exitStatus) >= 0;
+	}
 
 	std::wstring GetExecutableDir() {
 		wchar_t exePath[MAX_PATH];
@@ -371,8 +419,10 @@ namespace {
 	}
 
 	void DrawFinalStateText(Graphics& graphics, bool locked, float labelTop = OverlayLabelTop) {
-		const wchar_t* label = locked ? L"Locked" : L"Unlocked";
-		Font labelFont(L"Segoe UI", locked ? 34.0f : 30.0f, FontStyleBold, UnitPixel);
+		const bool kioskMode = g_SelectedMode == SageLockMode::Kiosk;
+		const wchar_t* label = kioskMode ? (locked ? L"Focused" : L"Unfocused") : (locked ? L"Locked" : L"Unlocked");
+		const float fontSize = kioskMode ? (locked ? 32.0f : 27.0f) : (locked ? 34.0f : 30.0f);
+		Font labelFont(L"Segoe UI", fontSize, FontStyleBold, UnitPixel);
 		StringFormat strFormat;
 		strFormat.SetAlignment(StringAlignmentCenter);
 		strFormat.SetLineAlignment(StringAlignmentCenter);
@@ -897,20 +947,430 @@ void SoundEffect(bool enable)
 	PlaySound(soundFile, NULL, SND_FILENAME | SND_ASYNC);
 }
 
+void UpdateTrayIcon() {
+	if (!g_TrayIconAdded) {
+		return;
+	}
+
+	swprintf_s(g_TrayIconData.szTip, L"SageLock - Mode: %s", GetModeName(g_SelectedMode));
+	g_TrayIconData.uFlags = NIF_TIP;
+	Shell_NotifyIconW(NIM_MODIFY, &g_TrayIconData);
+}
+
+bool AddTrayIcon(HWND hWnd) {
+	if (g_TrayIconAdded) {
+		return true;
+	}
+
+	ZeroMemory(&g_TrayIconData, sizeof(g_TrayIconData));
+	g_TrayIconData.cbSize = sizeof(g_TrayIconData);
+	g_TrayIconData.hWnd = hWnd;
+	g_TrayIconData.uID = TrayIconId;
+	g_TrayIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+	g_TrayIconData.uCallbackMessage = TrayMessageId;
+	g_TrayIconData.hIcon = LoadIconW(g_hInstance ? g_hInstance : GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_SAGE_LOCK));
+	if (!g_TrayIconData.hIcon) {
+		g_TrayIconData.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+	}
+	swprintf_s(g_TrayIconData.szTip, L"SageLock - Mode: %s", GetModeName(g_SelectedMode));
+
+	g_TrayIconAdded = Shell_NotifyIconW(NIM_ADD, &g_TrayIconData) == TRUE;
+	if (g_TrayIconAdded) {
+		tracelog(L"Tray icon added.\n");
+	}
+	else {
+		tracelog(L"Shell_NotifyIcon add failed: %s", GetLastErrorAsWString().c_str());
+	}
+	return g_TrayIconAdded;
+}
+
+void RemoveTrayIcon() {
+	if (!g_TrayIconAdded) {
+		return;
+	}
+
+	Shell_NotifyIconW(NIM_DELETE, &g_TrayIconData);
+	g_TrayIconAdded = false;
+	ZeroMemory(&g_TrayIconData, sizeof(g_TrayIconData));
+}
+
+void ReaddTrayIcon(HWND hWnd) {
+	g_TrayIconAdded = false;
+	AddTrayIcon(hWnd);
+	UpdateTrayIcon();
+	tracelog(L"Tray icon re-added after taskbar recreation.\n");
+}
+
+void ShowTrayMenu(HWND hWnd) {
+	HMENU menu = CreatePopupMenu();
+	if (!menu) {
+		return;
+	}
+
+	AppendMenuW(menu, MF_STRING | (g_SelectedMode == SageLockMode::ScreenLock ? MF_CHECKED : MF_UNCHECKED),
+		TrayMenuScreenLockModeId, L"Screen Lock Mode (Disable Touch Screen)");
+	AppendMenuW(menu, MF_STRING | (g_SelectedMode == SageLockMode::Kiosk ? MF_CHECKED : MF_UNCHECKED),
+		TrayMenuKioskModeId, L"Kiosk Mode (Exclusive App)");
+	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(menu, MF_STRING, TrayMenuCloseId, L"Close SageLock");
+
+	SetForegroundWindow(hWnd);
+	POINT cursor{};
+	GetCursorPos(&cursor);
+	TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, cursor.x, cursor.y, 0, hWnd, NULL);
+	PostMessageW(hWnd, WM_NULL, 0, 0);
+	DestroyMenu(menu);
+}
+
+bool IsProcessName(DWORD processId, const wchar_t* expectedName) {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	bool matched = false;
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (entry.th32ProcessID == processId && _wcsicmp(entry.szExeFile, expectedName) == 0) {
+				matched = true;
+				break;
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return matched;
+}
+
+bool IsExplorerProcessId(DWORD processId) {
+	return IsProcessName(processId, L"explorer.exe");
+}
+
+void TerminateExplorerProcesses() {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		tracelog(L"CreateToolhelp32Snapshot processes failed: %s", GetLastErrorAsWString().c_str());
+		return;
+	}
+
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (_wcsicmp(entry.szExeFile, L"explorer.exe") != 0) {
+				continue;
+			}
+
+			HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
+			if (!process) {
+				tracelog(L"OpenProcess explorer.exe failed for %lu: %s", entry.th32ProcessID, GetLastErrorAsWString().c_str());
+				continue;
+			}
+
+			if (NtTerminateProcessHandle(process, 0)) {
+				g_KilledExplorerForKiosk = true;
+				tracelog(L"Terminated explorer.exe process %lu for kiosk mode.\n", entry.th32ProcessID);
+			}
+			else {
+				tracelog(L"NtTerminateProcess explorer.exe failed for %lu.\n", entry.th32ProcessID);
+			}
+			CloseHandle(process);
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+}
+
+bool SetAutoRestartShellDisabled() {
+	if (g_AutoRestartShellChanged) {
+		return true;
+	}
+
+	HKEY key = NULL;
+	LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+		L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+		0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key);
+	if (status != ERROR_SUCCESS) {
+		tracelog(L"RegOpenKeyEx AutoRestartShell failed: %lu\n", status);
+		return false;
+	}
+
+	DWORD value = 0;
+	DWORD valueSize = sizeof(value);
+	DWORD valueType = 0;
+	status = RegQueryValueExW(key, L"AutoRestartShell", NULL, &valueType, reinterpret_cast<LPBYTE>(&value), &valueSize);
+	g_AutoRestartShellHadOriginalValue = status == ERROR_SUCCESS && valueType == REG_DWORD && valueSize == sizeof(value);
+	if (g_AutoRestartShellHadOriginalValue) {
+		g_AutoRestartShellOriginalValue = value;
+	}
+	else {
+		g_AutoRestartShellOriginalValue = 1;
+	}
+
+	DWORD disabled = 0;
+	status = RegSetValueExW(key, L"AutoRestartShell", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&disabled), sizeof(disabled));
+	RegCloseKey(key);
+	if (status != ERROR_SUCCESS) {
+		tracelog(L"RegSetValueEx AutoRestartShell=0 failed: %lu\n", status);
+		return false;
+	}
+
+	g_AutoRestartShellChanged = true;
+	tracelog(L"Disabled Winlogon AutoRestartShell for kiosk mode. hadOriginal=%d original=%lu\n",
+		g_AutoRestartShellHadOriginalValue ? 1 : 0, g_AutoRestartShellOriginalValue);
+	return true;
+}
+
+void RestoreAutoRestartShell() {
+	if (!g_AutoRestartShellChanged) {
+		return;
+	}
+
+	HKEY key = NULL;
+	LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+		L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+		0, KEY_SET_VALUE, &key);
+	if (status != ERROR_SUCCESS) {
+		tracelog(L"RegOpenKeyEx restore AutoRestartShell failed: %lu\n", status);
+		return;
+	}
+
+	if (g_AutoRestartShellHadOriginalValue) {
+		status = RegSetValueExW(key, L"AutoRestartShell", 0, REG_DWORD,
+			reinterpret_cast<const BYTE*>(&g_AutoRestartShellOriginalValue), sizeof(g_AutoRestartShellOriginalValue));
+	}
+	else {
+		status = RegDeleteValueW(key, L"AutoRestartShell");
+		if (status == ERROR_FILE_NOT_FOUND) {
+			status = ERROR_SUCCESS;
+		}
+	}
+	RegCloseKey(key);
+
+	if (status == ERROR_SUCCESS) {
+		tracelog(L"Restored Winlogon AutoRestartShell after kiosk mode.\n");
+		g_AutoRestartShellChanged = false;
+	}
+	else {
+		tracelog(L"Restore AutoRestartShell failed: %lu\n", status);
+	}
+}
+
+void RestartExplorerIfNeeded() {
+	const bool shouldRestartExplorer = g_KilledExplorerForKiosk;
+	RestoreAutoRestartShell();
+	if (!shouldRestartExplorer) {
+		return;
+	}
+
+	STARTUPINFOW startupInfo{};
+	startupInfo.cb = sizeof(startupInfo);
+	PROCESS_INFORMATION processInfo{};
+	wchar_t commandLine[] = L"explorer.exe";
+	if (CreateProcessW(NULL, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo)) {
+		CloseHandle(processInfo.hThread);
+		CloseHandle(processInfo.hProcess);
+		tracelog(L"Restarted explorer.exe after kiosk mode.\n");
+	}
+	else {
+		tracelog(L"CreateProcess explorer.exe failed after kiosk mode: %s", GetLastErrorAsWString().c_str());
+	}
+	g_KilledExplorerForKiosk = false;
+}
+
+bool SetKioskWorkAreaToFullMonitor(HWND targetWindow) {
+	if (g_KioskWorkAreaChanged) {
+		return true;
+	}
+
+	RECT originalWorkArea{};
+	if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &originalWorkArea, 0)) {
+		tracelog(L"SPI_GETWORKAREA failed before kiosk mode: %s", GetLastErrorAsWString().c_str());
+		return false;
+	}
+
+	HMONITOR monitor = MonitorFromWindow(targetWindow, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO monitorInfo{};
+	monitorInfo.cbSize = sizeof(monitorInfo);
+	if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+		tracelog(L"GetMonitorInfo failed before kiosk work-area update: %s", GetLastErrorAsWString().c_str());
+		return false;
+	}
+
+	RECT fullMonitorWorkArea = monitorInfo.rcMonitor;
+	if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &fullMonitorWorkArea, SPIF_SENDCHANGE)) {
+		tracelog(L"SPI_SETWORKAREA full monitor failed for kiosk mode: %s", GetLastErrorAsWString().c_str());
+		return false;
+	}
+
+	g_OriginalKioskWorkArea = originalWorkArea;
+	g_KioskWorkAreaChanged = true;
+	tracelog(L"Kiosk work area set to full monitor: left=%ld top=%ld right=%ld bottom=%ld\n",
+		fullMonitorWorkArea.left, fullMonitorWorkArea.top, fullMonitorWorkArea.right, fullMonitorWorkArea.bottom);
+	return true;
+}
+
+void RestoreKioskWorkArea() {
+	if (!g_KioskWorkAreaChanged) {
+		return;
+	}
+
+	RECT originalWorkArea = g_OriginalKioskWorkArea;
+	if (SystemParametersInfoW(SPI_SETWORKAREA, 0, &originalWorkArea, SPIF_SENDCHANGE)) {
+		g_KioskWorkAreaChanged = false;
+		tracelog(L"Restored kiosk work area: left=%ld top=%ld right=%ld bottom=%ld\n",
+			originalWorkArea.left, originalWorkArea.top, originalWorkArea.right, originalWorkArea.bottom);
+	}
+	else {
+		tracelog(L"Restore kiosk work area failed: %s", GetLastErrorAsWString().c_str());
+	}
+}
+
+bool IsSageLockOwnedWindow(HWND hWnd) {
+	wchar_t className[128]{};
+	GetClassNameW(hWnd, className, (int)_countof(className));
+	return wcscmp(className, L"RECV_RAW_INPT") == 0 || wcscmp(className, L"SAGE_LOCK_OVERLAY_WINDOW") == 0;
+}
+
+BOOL CALLBACK MinimizeWindowsExceptProc(HWND hWnd, LPARAM lParam) {
+	HWND targetWindow = reinterpret_cast<HWND>(lParam);
+	if (hWnd == targetWindow || !IsWindowVisible(hWnd) || GetWindow(hWnd, GW_OWNER) || IsSageLockOwnedWindow(hWnd)) {
+		return TRUE;
+	}
+
+	ShowWindow(hWnd, SW_MINIMIZE);
+	return TRUE;
+}
+
+void MinimizeWindowsExcept(HWND targetWindow) {
+	EnumWindows(MinimizeWindowsExceptProc, reinterpret_cast<LPARAM>(targetWindow));
+}
+
+void MaximizeKioskWindowToWorkArea() {
+	if (!g_KioskActive || !IsWindow(g_KioskWindowState.targetWindow)) {
+		return;
+	}
+
+	ShowWindow(g_KioskWindowState.targetWindow, SW_RESTORE);
+	ShowWindow(g_KioskWindowState.targetWindow, SW_MAXIMIZE);
+	SetForegroundWindow(g_KioskWindowState.targetWindow);
+}
+
+bool EnterKioskMode() {
+	HWND foregroundWindow = GetForegroundWindow();
+	if (!foregroundWindow || IsSageLockOwnedWindow(foregroundWindow)) {
+		tracelog(L"Kiosk mode enter failed: no eligible foreground window.\n");
+		return false;
+	}
+
+	g_KioskWindowState = {};
+	g_KioskWindowState.targetWindow = foregroundWindow;
+	g_KioskWindowState.placement.length = sizeof(g_KioskWindowState.placement);
+	g_KioskWindowState.hadPlacement = GetWindowPlacement(foregroundWindow, &g_KioskWindowState.placement) == TRUE;
+
+	if (!SetAutoRestartShellDisabled()) {
+		g_KioskWindowState = {};
+		tracelog(L"Kiosk mode enter failed: could not disable AutoRestartShell.\n");
+		return false;
+	}
+
+	g_KioskActive = true;
+	MinimizeWindowsExcept(foregroundWindow);
+	TerminateExplorerProcesses();
+	SetKioskWorkAreaToFullMonitor(foregroundWindow);
+	MaximizeKioskWindowToWorkArea();
+	tracelog(L"Kiosk mode enabled for hwnd=0x%p.\n", foregroundWindow);
+	return true;
+}
+
+void ExitKioskMode() {
+	if (!g_KioskActive) {
+		return;
+	}
+
+	HWND targetWindow = g_KioskWindowState.targetWindow;
+	if (IsWindow(targetWindow)) {
+		if (g_KioskWindowState.hadPlacement) {
+			SetWindowPlacement(targetWindow, &g_KioskWindowState.placement);
+		}
+	}
+
+	RestoreKioskWorkArea();
+	RestartExplorerIfNeeded();
+	g_KioskWindowState = {};
+	g_KioskActive = false;
+	tracelog(L"Kiosk mode disabled.\n");
+}
+
+void DisableScreenLockMode() {
+	if (!lock_enabled) {
+		return;
+	}
+
+	lock_enabled = false;
+	for (const auto& screen : g_TouchDeviceIds) {
+		ToggleTouchDevice(screen.c_str(), true);
+	}
+	SoundEffect(true);
+	tracelog(L"Screen lock mode disabled by mode transition.\n");
+}
+
+void SelectSageLockMode(SageLockMode mode) {
+	if (g_SelectedMode == mode) {
+		return;
+	}
+
+	DisableScreenLockMode();
+	ExitKioskMode();
+	g_SelectedMode = mode;
+	UpdateTrayIcon();
+	tracelog(L"SageLock selected mode changed: %s.\n", GetModeName(g_SelectedMode));
+}
+
+void CloseSageLock(HWND hWnd) {
+	DisableScreenLockMode();
+	ExitKioskMode();
+	RemoveTrayIcon();
+	DestroyWindow(hWnd);
+	PostQuitMessage(0);
+}
+
+void CompleteLockSequence() {
+	bool finalLocked = false;
+	if (g_SelectedMode == SageLockMode::ScreenLock) {
+		lock_enabled = !lock_enabled;
+		const bool enableTouch = !lock_enabled;
+		for (const auto& screen : g_TouchDeviceIds) {
+			ToggleTouchDevice(screen.c_str(), enableTouch);
+		}
+		SoundEffect(enableTouch);
+		finalLocked = lock_enabled;
+		tracelog(L"Screen lock sequence completed. lock_enabled=%d\n", lock_enabled ? 1 : 0);
+	}
+	else {
+		if (g_KioskActive) {
+			ExitKioskMode();
+			SoundEffect(true);
+			finalLocked = false;
+		}
+		else {
+			finalLocked = EnterKioskMode();
+			SoundEffect(!finalLocked);
+		}
+		tracelog(L"Kiosk sequence completed. kiosk_enabled=%d\n", finalLocked ? 1 : 0);
+	}
+
+	g_VolumePatternStep = 0;
+	ShowSequenceOverlay(4, true, finalLocked);
+	UpdateTrayIcon();
+}
+
 void SetKbdHistoryIndex(DWORD vkKey) {
 	auto i = GetAvailableKbdHistoryIndex();
 	Volume_Event_History[i] = vkKey;
 	UpdateSequenceProgress(vkKey);
 	if ((i == 3) && CheckForVolumeUpDownUpDown()) {
-		lock_enabled = !lock_enabled;
-		const bool enableTouch = !lock_enabled;
-		for (auto screen : g_TouchDeviceIds) {
-			ToggleTouchDevice(screen.c_str(), enableTouch);
-		}
-		SoundEffect(enableTouch);
-		g_VolumePatternStep = 0;
-		ShowSequenceOverlay(4, true, lock_enabled);
-		tracelog(L"Lock sequence completed. lock_enabled=%d\n", lock_enabled ? 1 : 0);
+		CompleteLockSequence();
 	}
 }
 
@@ -960,6 +1420,11 @@ void HandleKeyboardRawVolumeInput(const RAWKEYBOARD& keyboard) {
 }
 
 LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+	if (g_TaskbarCreatedMessage != 0 && uMsg == g_TaskbarCreatedMessage) {
+		ReaddTrayIcon(hWnd);
+		return 0;
+	}
+
 	if (uMsg == WM_INPUT) {
 		UINT dwSize = 0;
 		GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
@@ -979,6 +1444,25 @@ LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 			}
 		}
 	}
+	else if (uMsg == WM_COMMAND) {
+		switch (LOWORD(wParam)) {
+		case TrayMenuScreenLockModeId:
+			SelectSageLockMode(SageLockMode::ScreenLock);
+			return 0;
+		case TrayMenuKioskModeId:
+			SelectSageLockMode(SageLockMode::Kiosk);
+			return 0;
+		case TrayMenuCloseId:
+			CloseSageLock(hWnd);
+			return 0;
+		}
+	}
+	else if (uMsg == TrayMessageId) {
+		if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU || lParam == WM_LBUTTONUP) {
+			ShowTrayMenu(hWnd);
+			return 0;
+		}
+	}
 	else if (uMsg == WM_APPCOMMAND) {
 		const int command = GET_APPCOMMAND_LPARAM(lParam);
 		if (command == APPCOMMAND_VOLUME_UP) {
@@ -990,6 +1474,13 @@ LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 			return TRUE;
 		}
 	}
+	else if (uMsg == WM_DESTROY) {
+		DisableScreenLockMode();
+		ExitKioskMode();
+		RemoveTrayIcon();
+		PostQuitMessage(0);
+		return 0;
+	}
 	return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
@@ -997,6 +1488,7 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	g_hInstance = GetModuleHandle(NULL);
 	EnsureGdiPlusInitialized();
 	LoadOverlayBitmaps();
+	g_TaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
 	static const wchar_t* winClassName = L"RECV_RAW_INPT";
 	WNDCLASSEX wx = {};
@@ -1024,11 +1516,16 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	if (!hWnd) {
 		tracelog(L"Raw input window creation failed: %d\n", GetLastError());
 	}
-	else if (!RegisterRawInputDevices(Rid, 2, sizeof(Rid[0]))) {
-		tracelog(L"RegisterRawInputDevices failed: %d\n", GetLastError());
-	}
 	else {
-		tracelog(L"Raw input registered on hidden window for keyboard and consumer controls.\n");
+		g_MessageWindow = hWnd;
+		AddTrayIcon(hWnd);
+
+		if (!RegisterRawInputDevices(Rid, 2, sizeof(Rid[0]))) {
+			tracelog(L"RegisterRawInputDevices failed: %d\n", GetLastError());
+		}
+		else {
+			tracelog(L"Raw input registered on hidden window for keyboard and consumer controls.\n");
+		}
 	}
 
 #ifdef _DEBUG
@@ -1043,6 +1540,7 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	}
 
 	DestroyOverlayWindows();
+	RemoveTrayIcon();
 	UnloadOverlayBitmaps();
 	ShutdownGdiPlus();
 	return 0;
