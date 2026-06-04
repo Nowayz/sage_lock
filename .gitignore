@@ -1,0 +1,50 @@
+# Visual Studio user/cache state
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build output directories
+[Dd]ebug/
+[Rr]elease/
+[Aa][Rr][Mm]64/
+[Ww]in32/
+x64/
+*/x64/
+*/ARM64/
+*/Debug/
+*/Release/
+
+# C/C++ build intermediates
+*.obj
+*.iobj
+*.pdb
+*.ipdb
+*.ilk
+*.idb
+*.res
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+*.pch
+*.ipch
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+*.FileListAbsolute.txt
+*.Build.CppClean.log
+
+# Runtime/debug logs
+sage_lock-debug.log
+
+# Keep source assets/resources tracked
+!sage_lock/*.png
+!sage_lock/*.ico
+!sage_lock/*.rc
+!sage_lock/resource.h
