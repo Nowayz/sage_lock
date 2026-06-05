@@ -10,19 +10,14 @@
 #include <Windowsx.h>
 #include <shellapi.h>
 #include <TlHelp32.h>
-#include <iostream>
-#include <array>
 #include <initguid.h>
-#include <ntddstor.h>
 #include <hidusage.h>
 #include <SetupAPI.h>
 #include <Cfgmgr32.h>
 #include <Hidclass.h>
 #include <Hidsdi.h>
-#include <hidusage.h>
 #include <vector>
 #include <string>
-#include <iomanip>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -36,28 +31,6 @@ using namespace Gdiplus;
 #pragma comment(lib, "Cfgmgr32.lib")
 #pragma comment(lib, "Winmm.lib")
 #pragma comment(lib, "gdiplus.lib")
-
-// function dbgprint prints to visual studio output window
-void dbgprint(const wchar_t* format, ...) {
-	wchar_t buffer[4096];
-	va_list args;
-	va_start(args, format);
-	vswprintf_s(buffer, 4096, format, args);
-	OutputDebugStringW(buffer);
-	va_end(args);
-}
-
-std::wstring GetLastErrorAsWString()
-{
-	DWORD errorMessageID = ::GetLastError();
-	if (errorMessageID == 0) {
-		return std::wstring(L"No error"); //No error message has been recorded
-	}
-	wchar_t lpBuffer[256];
-	FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-				NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), lpBuffer, (DWORD)_countof(lpBuffer), NULL);
-	return lpBuffer;
-}
 
 namespace {
 	constexpr int OverlayWindowSize = 280;
@@ -87,7 +60,6 @@ namespace {
 	};
 
 	SageLockMode g_SelectedMode = SageLockMode::ScreenLock;
-	HWND g_MessageWindow = NULL;
 	UINT g_TaskbarCreatedMessage = 0;
 	NOTIFYICONDATAW g_TrayIconData{};
 	bool g_TrayIconAdded = false;
@@ -144,7 +116,6 @@ namespace {
 	DWORD64 g_LastVolumePatternTick = 0;
 	DWORD g_LastAcceptedVolumeVk = 0;
 	DWORD64 g_LastAcceptedVolumeTick = 0;
-	DWORD64 g_LastSuppressedVolumeLogTick = 0;
 	constexpr DWORD64 VolumeSameKeyDebounceMs = 650;
 	bool g_KeyboardVolumeUpDown = false;
 	bool g_KeyboardVolumeDownDown = false;
@@ -171,56 +142,6 @@ namespace {
 		return ntTerminateProcess(process, exitStatus) >= 0;
 	}
 
-	std::wstring GetExecutableDir() {
-		wchar_t exePath[MAX_PATH];
-		GetModuleFileNameW(NULL, exePath, MAX_PATH);
-		auto path = std::wstring(exePath);
-		auto pos = path.find_last_of(L"\\/");
-		if (pos == std::wstring::npos) {
-			return path;
-		}
-		return path.substr(0, pos);
-	}
-
-	void tracelog(const wchar_t* format, ...) {
-		wchar_t buffer[4096];
-		va_list args;
-		va_start(args, format);
-		vswprintf_s(buffer, 4096, format, args);
-		va_end(args);
-
-		dbgprint(L"%s", buffer);
-
-#ifdef _DEBUG
-		HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-		if (hStdout && hStdout != INVALID_HANDLE_VALUE) {
-			DWORD consoleWritten = 0;
-			WriteConsoleW(hStdout, buffer, lstrlenW(buffer), &consoleWritten, NULL);
-		}
-
-		auto logPath = GetExecutableDir() + L"\\sage_lock-debug.log";
-		HANDLE hLog = CreateFileW(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-			NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (hLog == INVALID_HANDLE_VALUE) {
-			return;
-		}
-
-		int requiredBytes = WideCharToMultiByte(CP_UTF8, 0, buffer, -1, NULL, 0, NULL, NULL);
-		if (requiredBytes <= 1) {
-			CloseHandle(hLog);
-			return;
-		}
-
-		std::string utf8(requiredBytes, '\0');
-		int bytes = WideCharToMultiByte(CP_UTF8, 0, buffer, -1, &utf8[0], requiredBytes, NULL, NULL);
-		if (bytes > 1) {
-			DWORD written = 0;
-			WriteFile(hLog, utf8.data(), bytes - 1, &written, NULL);
-		}
-		CloseHandle(hLog);
-#endif
-	}
-
 	void EnsureGdiPlusInitialized() {
 		if (g_GdiPlusInitialized) {
 			return;
@@ -229,10 +150,6 @@ namespace {
 		auto status = GdiplusStartup(&g_GdiPlusToken, &startupInput, NULL);
 		if (status == Ok) {
 			g_GdiPlusInitialized = true;
-			tracelog(L"GDI+ initialized.\n");
-		}
-		else {
-			tracelog(L"GDI+ failed to initialize: %d\n", status);
 		}
 	}
 
@@ -250,7 +167,6 @@ namespace {
 			const int resourceId = g_OverlayImageResources[i];
 			HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), L"PNG");
 			if (!resource) {
-				tracelog(L"Could not find overlay image resource: %d\n", resourceId);
 				g_OverlayBitmaps[i] = nullptr;
 				continue;
 			}
@@ -259,14 +175,12 @@ namespace {
 			HGLOBAL loadedResource = LoadResource(module, resource);
 			const void* resourceData = loadedResource ? LockResource(loadedResource) : nullptr;
 			if (!resourceSize || !resourceData) {
-				tracelog(L"Could not load overlay image resource: %d\n", resourceId);
 				g_OverlayBitmaps[i] = nullptr;
 				continue;
 			}
 
 			HGLOBAL imageMemory = GlobalAlloc(GMEM_MOVEABLE, resourceSize);
 			if (!imageMemory) {
-				tracelog(L"Could not allocate overlay image memory: %d\n", resourceId);
 				g_OverlayBitmaps[i] = nullptr;
 				continue;
 			}
@@ -274,7 +188,6 @@ namespace {
 			void* imageBuffer = GlobalLock(imageMemory);
 			if (!imageBuffer) {
 				GlobalFree(imageMemory);
-				tracelog(L"Could not lock overlay image memory: %d\n", resourceId);
 				g_OverlayBitmaps[i] = nullptr;
 				continue;
 			}
@@ -285,7 +198,6 @@ namespace {
 			IStream* imageStream = nullptr;
 			if (CreateStreamOnHGlobal(imageMemory, TRUE, &imageStream) != S_OK || !imageStream) {
 				GlobalFree(imageMemory);
-				tracelog(L"Could not create overlay image stream: %d\n", resourceId);
 				g_OverlayBitmaps[i] = nullptr;
 				continue;
 			}
@@ -293,13 +205,11 @@ namespace {
 			auto bitmap = Bitmap::FromStream(imageStream, false);
 			imageStream->Release();
 			if (!bitmap || bitmap->GetLastStatus() != Ok) {
-				tracelog(L"Could not decode overlay image resource: %d\n", resourceId);
 				delete bitmap;
 				g_OverlayBitmaps[i] = nullptr;
 			}
 			else {
 				g_OverlayBitmaps[i] = bitmap;
-				tracelog(L"Loaded overlay image resource: %d\n", resourceId);
 			}
 		}
 	}
@@ -356,46 +266,6 @@ namespace {
 		}
 
 		return monitorRects;
-	}
-
-	void DrawLockFallback(Graphics& graphics, float scale) {
-		const float cx = OverlayWindowSize / 2.0f;
-		const float cy = OverlayWindowSize / 2.0f;
-		const float padW = 74.0f * scale;
-		const float padH = 58.0f * scale;
-		const float lockY = cy - 10.0f * scale;
-
-		SolidBrush body(Color(255, 245, 245, 245));
-		Pen shacklePen(Color(255, 245, 245, 245), 10.0f * scale);
-
-		graphics.FillRectangle(&body, RectF(cx - padW / 2.0f, lockY, padW, padH));
-		graphics.FillRectangle(&body, cx - padW / 4.0f, lockY + padH - 9.0f, padW / 2.0f, 14.0f * scale);
-		graphics.DrawArc(&shacklePen, cx - padW / 2.0f + 6.0f, lockY - 22.0f, padW - 12.0f, 36.0f * scale, 0.0f, -180.0f);
-	}
-
-	void DrawFallbackStep(Graphics& graphics, int step, bool finalStep, float scale) {
-		const float cx = OverlayWindowSize / 2.0f;
-		const float cy = OverlayWindowSize / 2.0f;
-
-		SolidBrush halo(Color(200, 0, 0, 0));
-		graphics.FillEllipse(&halo, 34.0f, 34.0f, OverlayWindowSize - 68.0f, OverlayWindowSize - 68.0f);
-		Pen edge(Color(220, 220, 220, 220), 4.0f);
-		graphics.DrawEllipse(&edge, 34.0f, 34.0f, OverlayWindowSize - 68.0f, OverlayWindowSize - 68.0f);
-
-		if (finalStep) {
-			DrawLockFallback(graphics, scale);
-			return;
-		}
-
-		wchar_t stepText[8];
-		swprintf_s(stepText, L"%d", step);
-		Font stepFont(L"Segoe UI", 120.0f, FontStyleBold, UnitPixel);
-		StringFormat strFormat;
-		strFormat.SetAlignment(StringAlignmentCenter);
-		strFormat.SetLineAlignment(StringAlignmentCenter);
-		SolidBrush textBrush(Color(255, 245, 245, 245));
-		RectF textRect(0, 0, (REAL)OverlayWindowSize, (REAL)OverlayWindowSize);
-		graphics.DrawString(stepText, -1, &stepFont, textRect, &strFormat, &textBrush);
 	}
 
 	void DrawProgressDots(Graphics& graphics, int activeStep, float dotsY = OverlayDotsY) {
@@ -486,10 +356,6 @@ namespace {
 
 			graphics.DrawImage(image, x, y, imgW, imgH);
 		}
-		else {
-			DrawFallbackStep(graphics, g_OverlayState.currentStep, g_OverlayState.finalStep, renderScale);
-		}
-
 		DrawProgressDots(graphics, g_OverlayState.currentStep, progressDotsY);
 		if (g_OverlayState.finalStep) {
 			DrawFinalStateText(graphics, g_OverlayState.finalLocked, finalLabelTop);
@@ -506,9 +372,7 @@ namespace {
 		blend.SourceConstantAlpha = 255;
 		blend.AlphaFormat = AC_SRC_ALPHA;
 
-		if (!UpdateLayeredWindow(overlayWindow.hWnd, screenDC, &destination, &size, memDC, &sourcePoint, RGB(0, 0, 0), &blend, ULW_ALPHA)) {
-			tracelog(L"UpdateLayeredWindow failed: %d\n", GetLastError());
-		}
+		UpdateLayeredWindow(overlayWindow.hWnd, screenDC, &destination, &size, memDC, &sourcePoint, RGB(0, 0, 0), &blend, ULW_ALPHA);
 
 		SelectObject(memDC, oldBmp);
 		DeleteObject(dib);
@@ -566,7 +430,6 @@ namespace {
 		wc.lpszClassName = overlayClassName;
 
 		if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-			tracelog(L"RegisterClassEx overlay failed: %d\n", GetLastError());
 			return false;
 		}
 
@@ -610,14 +473,9 @@ namespace {
 				ShowWindow(overlayWindow.hWnd, SW_HIDE);
 				g_OverlayWindows.push_back(overlayWindow);
 			}
-			else {
-				tracelog(L"CreateWindowEx overlay failed for monitor [%ld,%ld,%ld,%ld]: %d\n",
-					bounds.left, bounds.top, bounds.right, bounds.bottom, GetLastError());
-			}
 		}
 
 		g_OverlayMonitorRects = monitorRects;
-		tracelog(L"Overlay windows ready: %zu monitor(s), %zu window(s).\n", monitorRects.size(), g_OverlayWindows.size());
 	}
 
 	void ShowOverlayWindows() {
@@ -635,7 +493,6 @@ namespace {
 
 		EnsureOverlayWindowsForCurrentMonitors(g_hInstance);
 		if (g_OverlayWindows.empty()) {
-			tracelog(L"ShowSequenceOverlay skipped: no overlay windows.\n");
 			return;
 		}
 
@@ -649,7 +506,6 @@ namespace {
 		ShowOverlayWindows();
 		RenderOverlayFrames();
 		StartOverlayTimer();
-		tracelog(L"ShowSequenceOverlay step=%d final=%d windows=%zu.\n", step, finalStep ? 1 : 0, g_OverlayWindows.size());
 	}
 
 	void HideSequenceOverlay() {
@@ -671,7 +527,7 @@ namespace {
 		RenderOverlayFrames();
 	}
 
-	void UpdateSequenceProgress(DWORD vk) {
+	bool UpdateSequenceProgress(DWORD vk) {
 		const DWORD expected[4] = { VK_VOLUME_UP, VK_VOLUME_DOWN, VK_VOLUME_UP, VK_VOLUME_DOWN };
 		const auto now = GetTickCount64();
 
@@ -694,30 +550,8 @@ namespace {
 		else {
 			HideSequenceOverlay();
 		}
-	}
 
-	void LogRawHidBytes(const RAWHID& hid) {
-#ifdef _DEBUG
-		wchar_t buffer[1024];
-		wchar_t* cursor = buffer;
-		size_t remaining = _countof(buffer);
-
-		int written = swprintf_s(cursor, remaining, L"Raw HID input: size=%lu count=%lu data=", hid.dwSizeHid, hid.dwCount);
-		if (written < 0) return;
-		cursor += written;
-		remaining -= written;
-
-		DWORD byteCount = (std::min)(hid.dwSizeHid * hid.dwCount, 32UL);
-		for (DWORD i = 0; i < byteCount && remaining > 4; i++) {
-			written = swprintf_s(cursor, remaining, L"%02X ", hid.bRawData[i]);
-			if (written < 0) break;
-			cursor += written;
-			remaining -= written;
-		}
-
-		swprintf_s(cursor, remaining, L"\n");
-		tracelog(L"%s", buffer);
-#endif
+		return g_VolumePatternStep == 4;
 	}
 
 	bool TryGetVolumeKeyFromConsumerHid(const RAWINPUT* eventInfo, DWORD& vkKey) {
@@ -726,7 +560,6 @@ namespace {
 		}
 
 		const RAWHID& hid = eventInfo->data.hid;
-		LogRawHidBytes(hid);
 
 		bool reportHasVolumeUp = false;
 		bool reportHasVolumeDown = false;
@@ -756,13 +589,6 @@ namespace {
 		bool volumeUpPress = reportHasVolumeUp && !g_ConsumerVolumeUpDown;
 		bool volumeDownPress = reportHasVolumeDown && !g_ConsumerVolumeDownDown;
 
-		if (!reportHasVolumeUp && g_ConsumerVolumeUpDown) {
-			tracelog(L"Volume consumer HID release: vk=0x%02X\n", VK_VOLUME_UP);
-		}
-		if (!reportHasVolumeDown && g_ConsumerVolumeDownDown) {
-			tracelog(L"Volume consumer HID release: vk=0x%02X\n", VK_VOLUME_DOWN);
-		}
-
 		g_ConsumerVolumeUpDown = reportHasVolumeUp;
 		g_ConsumerVolumeDownDown = reportHasVolumeDown;
 
@@ -773,10 +599,6 @@ namespace {
 		if (volumeDownPress) {
 			vkKey = VK_VOLUME_DOWN;
 			return true;
-		}
-
-		if (reportHasVolumeUp || reportHasVolumeDown) {
-			tracelog(L"Volume consumer HID held repeat suppressed.\n");
 		}
 
 		return false;
@@ -798,66 +620,25 @@ namespace {
 }
 
 // GLOBALS TO TRACK VOLUME UP DOWN UP DOWN EVENTS
-std::array<DWORD, 4> Volume_Event_History{};
-WORD Current_Index = 0;
-DWORD64 Last_Volume_Event = 0;
 bool lock_enabled = false;
 std::vector<std::wstring> g_TouchDeviceIds;
-
-// Check Volume_Event_History for UP DOWN UP DOWN events in the last 2 seconds
-auto CheckForVolumeUpDownUpDown() {
-	Current_Index = 0;
-	return (Volume_Event_History[0] == VK_VOLUME_UP &&
-		Volume_Event_History[1] == VK_VOLUME_DOWN &&
-		Volume_Event_History[2] == VK_VOLUME_UP &&
-		Volume_Event_History[3] == VK_VOLUME_DOWN);
-}
-
-// This function returns the index of the next available slot in the volume history array.
-// The index is determined by the time since the last volume change event.
-auto GetAvailableKbdHistoryIndex() {
-	auto dwCurrentTime = GetTickCount64();
-	auto timeSinceLast = dwCurrentTime - Last_Volume_Event;
-	Last_Volume_Event = dwCurrentTime;
-	if ((timeSinceLast) > 500) {
-		Current_Index = 0;
-		Volume_Event_History.fill(0);
-	}
-	else {
-		Current_Index++;
-	}
-	if (Current_Index > 3) {
-		Current_Index = 0;
-	}
-	return Current_Index;
-}
-
-std::wstring ConfigRetToWString(CONFIGRET cr) {
-	DWORD win32Error = CM_MapCrToWin32Err(cr, ERROR_GEN_FAILURE);
-	wchar_t message[512]{};
-	FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-		NULL, win32Error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		message, (DWORD)_countof(message), NULL);
-
-	wchar_t result[768]{};
-	swprintf_s(result, L"CONFIGRET=0x%08X Win32=%lu %s", cr, win32Error, message);
-	return result;
-}
 
 void ToggleTouchDevice(const wchar_t* deviceId, bool enable) {
 	DEVINST devInst = 0;
 	CONFIGRET locateCr = CM_Locate_DevNodeW(&devInst, const_cast<DEVINSTID_W>(deviceId), CM_LOCATE_DEVNODE_NORMAL);
 	if (locateCr != CR_SUCCESS) {
-		tracelog(L"CM_Locate_DevNodeW failed for %s: %s\n", deviceId, ConfigRetToWString(locateCr).c_str());
 		return;
 	}
 
-	CONFIGRET toggleCr = enable ? CM_Enable_DevNode(devInst, 0) : CM_Disable_DevNode(devInst, 0);
-	tracelog(L"%s touch device via Configuration Manager: DeviceId=%s Result=%s\n",
-		enable ? L"Enabled" : L"Disabled", deviceId, ConfigRetToWString(toggleCr).c_str());
+	if (enable) {
+		CM_Enable_DevNode(devInst, 0);
+	}
+	else {
+		CM_Disable_DevNode(devInst, 0);
+	}
 }
 
-void AddTouchDeviceId(const wchar_t* source, const std::wstring& deviceId, USHORT usagePage = 0, USHORT usage = 0) {
+void AddTouchDeviceId(const std::wstring& deviceId) {
 	if (deviceId.empty()) {
 		return;
 	}
@@ -867,18 +648,14 @@ void AddTouchDeviceId(const wchar_t* source, const std::wstring& deviceId, USHOR
 	}
 
 	g_TouchDeviceIds.push_back(deviceId);
-	tracelog(L"Touch target matched via %s: UsagePage=0x%04X Usage=0x%04X Device=%s\n",
-		source, usagePage, usage, deviceId.c_str());
 }
 
 void RefreshTouchDeviceIdsFromHidCaps()
 {
-	tracelog(L"Refreshing HID touch device IDs for SageLock toggling.\n");
 	g_TouchDeviceIds.clear();
 
 	HDEVINFO deviceInfoSet = SetupDiGetClassDevs(&GUID_DEVINTERFACE_HID, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
 	if (deviceInfoSet == INVALID_HANDLE_VALUE) {
-		tracelog(L"SetupDiGetClassDevs failed: %s", GetLastErrorAsWString().c_str());
 		return;
 	}
 
@@ -916,14 +693,10 @@ void RefreshTouchDeviceIdsFromHidCaps()
 							caps.Usage == HID_USAGE_DIGITIZER_TOUCH_SCREEN ||
 							caps.Usage == HID_USAGE_DIGITIZER_MULTI_POINT))
 					{
-						CONFIGRET cr;
-						// get string with deviceid 
 						WCHAR deviceId[MAX_DEVICE_ID_LEN]{};
-						if ((cr = CM_Get_Device_IDW(devInfoData.DevInst, deviceId, MAX_DEVICE_ID_LEN, 0)) != CR_SUCCESS) {
-							tracelog(L"CM_Get_Device_IDW failed with error %08X\n", cr);
+						if (CM_Get_Device_IDW(devInfoData.DevInst, deviceId, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+							AddTouchDeviceId(deviceId);
 						}
-
-						AddTouchDeviceId(L"HIDCaps", deviceId, caps.UsagePage, caps.Usage);
 					}
 					HidD_FreePreparsedData(preparsedData);
 				}
@@ -934,11 +707,6 @@ void RefreshTouchDeviceIdsFromHidCaps()
 		LocalFree(detailData);
 	}
 	SetupDiDestroyDeviceInfoList(deviceInfoSet);
-
-	tracelog(L"SageLock toggle target count: %zu\n", g_TouchDeviceIds.size());
-	if (g_TouchDeviceIds.empty()) {
-		tracelog(L"WARNING: no HID touch device IDs matched; lock sequence will not toggle any devices.\n");
-	}
 }
 
 void SoundEffect(bool enable)
@@ -975,12 +743,6 @@ bool AddTrayIcon(HWND hWnd) {
 	swprintf_s(g_TrayIconData.szTip, L"SageLock - Mode: %s", GetModeName(g_SelectedMode));
 
 	g_TrayIconAdded = Shell_NotifyIconW(NIM_ADD, &g_TrayIconData) == TRUE;
-	if (g_TrayIconAdded) {
-		tracelog(L"Tray icon added.\n");
-	}
-	else {
-		tracelog(L"Shell_NotifyIcon add failed: %s", GetLastErrorAsWString().c_str());
-	}
 	return g_TrayIconAdded;
 }
 
@@ -998,7 +760,6 @@ void ReaddTrayIcon(HWND hWnd) {
 	g_TrayIconAdded = false;
 	AddTrayIcon(hWnd);
 	UpdateTrayIcon();
-	tracelog(L"Tray icon re-added after taskbar recreation.\n");
 }
 
 void ShowTrayMenu(HWND hWnd) {
@@ -1022,35 +783,9 @@ void ShowTrayMenu(HWND hWnd) {
 	DestroyMenu(menu);
 }
 
-bool IsProcessName(DWORD processId, const wchar_t* expectedName) {
-	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snapshot == INVALID_HANDLE_VALUE) {
-		return false;
-	}
-
-	PROCESSENTRY32W entry{};
-	entry.dwSize = sizeof(entry);
-	bool matched = false;
-	if (Process32FirstW(snapshot, &entry)) {
-		do {
-			if (entry.th32ProcessID == processId && _wcsicmp(entry.szExeFile, expectedName) == 0) {
-				matched = true;
-				break;
-			}
-		} while (Process32NextW(snapshot, &entry));
-	}
-	CloseHandle(snapshot);
-	return matched;
-}
-
-bool IsExplorerProcessId(DWORD processId) {
-	return IsProcessName(processId, L"explorer.exe");
-}
-
 void TerminateExplorerProcesses() {
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (snapshot == INVALID_HANDLE_VALUE) {
-		tracelog(L"CreateToolhelp32Snapshot processes failed: %s", GetLastErrorAsWString().c_str());
 		return;
 	}
 
@@ -1064,16 +799,11 @@ void TerminateExplorerProcesses() {
 
 			HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
 			if (!process) {
-				tracelog(L"OpenProcess explorer.exe failed for %lu: %s", entry.th32ProcessID, GetLastErrorAsWString().c_str());
 				continue;
 			}
 
 			if (NtTerminateProcessHandle(process, 0)) {
 				g_KilledExplorerForKiosk = true;
-				tracelog(L"Terminated explorer.exe process %lu for kiosk mode.\n", entry.th32ProcessID);
-			}
-			else {
-				tracelog(L"NtTerminateProcess explorer.exe failed for %lu.\n", entry.th32ProcessID);
 			}
 			CloseHandle(process);
 		} while (Process32NextW(snapshot, &entry));
@@ -1091,7 +821,6 @@ bool SetAutoRestartShellDisabled() {
 		L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
 		0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key);
 	if (status != ERROR_SUCCESS) {
-		tracelog(L"RegOpenKeyEx AutoRestartShell failed: %lu\n", status);
 		return false;
 	}
 
@@ -1111,13 +840,10 @@ bool SetAutoRestartShellDisabled() {
 	status = RegSetValueExW(key, L"AutoRestartShell", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&disabled), sizeof(disabled));
 	RegCloseKey(key);
 	if (status != ERROR_SUCCESS) {
-		tracelog(L"RegSetValueEx AutoRestartShell=0 failed: %lu\n", status);
 		return false;
 	}
 
 	g_AutoRestartShellChanged = true;
-	tracelog(L"Disabled Winlogon AutoRestartShell for kiosk mode. hadOriginal=%d original=%lu\n",
-		g_AutoRestartShellHadOriginalValue ? 1 : 0, g_AutoRestartShellOriginalValue);
 	return true;
 }
 
@@ -1131,7 +857,6 @@ void RestoreAutoRestartShell() {
 		L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
 		0, KEY_SET_VALUE, &key);
 	if (status != ERROR_SUCCESS) {
-		tracelog(L"RegOpenKeyEx restore AutoRestartShell failed: %lu\n", status);
 		return;
 	}
 
@@ -1148,11 +873,7 @@ void RestoreAutoRestartShell() {
 	RegCloseKey(key);
 
 	if (status == ERROR_SUCCESS) {
-		tracelog(L"Restored Winlogon AutoRestartShell after kiosk mode.\n");
 		g_AutoRestartShellChanged = false;
-	}
-	else {
-		tracelog(L"Restore AutoRestartShell failed: %lu\n", status);
 	}
 }
 
@@ -1170,10 +891,6 @@ void RestartExplorerIfNeeded() {
 	if (CreateProcessW(NULL, commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo)) {
 		CloseHandle(processInfo.hThread);
 		CloseHandle(processInfo.hProcess);
-		tracelog(L"Restarted explorer.exe after kiosk mode.\n");
-	}
-	else {
-		tracelog(L"CreateProcess explorer.exe failed after kiosk mode: %s", GetLastErrorAsWString().c_str());
 	}
 	g_KilledExplorerForKiosk = false;
 }
@@ -1185,7 +902,6 @@ bool SetKioskWorkAreaToFullMonitor(HWND targetWindow) {
 
 	RECT originalWorkArea{};
 	if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &originalWorkArea, 0)) {
-		tracelog(L"SPI_GETWORKAREA failed before kiosk mode: %s", GetLastErrorAsWString().c_str());
 		return false;
 	}
 
@@ -1193,20 +909,16 @@ bool SetKioskWorkAreaToFullMonitor(HWND targetWindow) {
 	MONITORINFO monitorInfo{};
 	monitorInfo.cbSize = sizeof(monitorInfo);
 	if (!GetMonitorInfoW(monitor, &monitorInfo)) {
-		tracelog(L"GetMonitorInfo failed before kiosk work-area update: %s", GetLastErrorAsWString().c_str());
 		return false;
 	}
 
 	RECT fullMonitorWorkArea = monitorInfo.rcMonitor;
 	if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &fullMonitorWorkArea, SPIF_SENDCHANGE)) {
-		tracelog(L"SPI_SETWORKAREA full monitor failed for kiosk mode: %s", GetLastErrorAsWString().c_str());
 		return false;
 	}
 
 	g_OriginalKioskWorkArea = originalWorkArea;
 	g_KioskWorkAreaChanged = true;
-	tracelog(L"Kiosk work area set to full monitor: left=%ld top=%ld right=%ld bottom=%ld\n",
-		fullMonitorWorkArea.left, fullMonitorWorkArea.top, fullMonitorWorkArea.right, fullMonitorWorkArea.bottom);
 	return true;
 }
 
@@ -1218,11 +930,6 @@ void RestoreKioskWorkArea() {
 	RECT originalWorkArea = g_OriginalKioskWorkArea;
 	if (SystemParametersInfoW(SPI_SETWORKAREA, 0, &originalWorkArea, SPIF_SENDCHANGE)) {
 		g_KioskWorkAreaChanged = false;
-		tracelog(L"Restored kiosk work area: left=%ld top=%ld right=%ld bottom=%ld\n",
-			originalWorkArea.left, originalWorkArea.top, originalWorkArea.right, originalWorkArea.bottom);
-	}
-	else {
-		tracelog(L"Restore kiosk work area failed: %s", GetLastErrorAsWString().c_str());
 	}
 }
 
@@ -1259,7 +966,6 @@ void MaximizeKioskWindowToWorkArea() {
 bool EnterKioskMode() {
 	HWND foregroundWindow = GetForegroundWindow();
 	if (!foregroundWindow || IsSageLockOwnedWindow(foregroundWindow)) {
-		tracelog(L"Kiosk mode enter failed: no eligible foreground window.\n");
 		return false;
 	}
 
@@ -1270,7 +976,6 @@ bool EnterKioskMode() {
 
 	if (!SetAutoRestartShellDisabled()) {
 		g_KioskWindowState = {};
-		tracelog(L"Kiosk mode enter failed: could not disable AutoRestartShell.\n");
 		return false;
 	}
 
@@ -1279,7 +984,6 @@ bool EnterKioskMode() {
 	TerminateExplorerProcesses();
 	SetKioskWorkAreaToFullMonitor(foregroundWindow);
 	MaximizeKioskWindowToWorkArea();
-	tracelog(L"Kiosk mode enabled for hwnd=0x%p.\n", foregroundWindow);
 	return true;
 }
 
@@ -1299,7 +1003,6 @@ void ExitKioskMode() {
 	RestartExplorerIfNeeded();
 	g_KioskWindowState = {};
 	g_KioskActive = false;
-	tracelog(L"Kiosk mode disabled.\n");
 }
 
 void DisableScreenLockMode() {
@@ -1312,7 +1015,6 @@ void DisableScreenLockMode() {
 		ToggleTouchDevice(screen.c_str(), true);
 	}
 	SoundEffect(true);
-	tracelog(L"Screen lock mode disabled by mode transition.\n");
 }
 
 void SelectSageLockMode(SageLockMode mode) {
@@ -1324,7 +1026,6 @@ void SelectSageLockMode(SageLockMode mode) {
 	ExitKioskMode();
 	g_SelectedMode = mode;
 	UpdateTrayIcon();
-	tracelog(L"SageLock selected mode changed: %s.\n", GetModeName(g_SelectedMode));
 }
 
 void CloseSageLock(HWND hWnd) {
@@ -1345,7 +1046,6 @@ void CompleteLockSequence() {
 		}
 		SoundEffect(enableTouch);
 		finalLocked = lock_enabled;
-		tracelog(L"Screen lock sequence completed. lock_enabled=%d\n", lock_enabled ? 1 : 0);
 	}
 	else {
 		if (g_KioskActive) {
@@ -1357,7 +1057,6 @@ void CompleteLockSequence() {
 			finalLocked = EnterKioskMode();
 			SoundEffect(!finalLocked);
 		}
-		tracelog(L"Kiosk sequence completed. kiosk_enabled=%d\n", finalLocked ? 1 : 0);
 	}
 
 	g_VolumePatternStep = 0;
@@ -1365,31 +1064,18 @@ void CompleteLockSequence() {
 	UpdateTrayIcon();
 }
 
-void SetKbdHistoryIndex(DWORD vkKey) {
-	auto i = GetAvailableKbdHistoryIndex();
-	Volume_Event_History[i] = vkKey;
-	UpdateSequenceProgress(vkKey);
-	if ((i == 3) && CheckForVolumeUpDownUpDown()) {
-		CompleteLockSequence();
-	}
-}
-
-void HandleVolumeKeyEvent(DWORD vkKey, const wchar_t* source) {
+void HandleVolumeKeyEvent(DWORD vkKey) {
 	DWORD64 now = GetTickCount64();
-	DWORD64 sinceLastAccepted = now - g_LastAcceptedVolumeTick;
 
-	if (g_LastAcceptedVolumeVk == vkKey && sinceLastAccepted < VolumeSameKeyDebounceMs) {
-		if ((now - g_LastSuppressedVolumeLogTick) > 500) {
-			tracelog(L"Volume %s suppressed duplicate: vk=0x%02X age=%llums\n", source, vkKey, sinceLastAccepted);
-			g_LastSuppressedVolumeLogTick = now;
-		}
+	if (g_LastAcceptedVolumeVk == vkKey && (now - g_LastAcceptedVolumeTick) < VolumeSameKeyDebounceMs) {
 		return;
 	}
 
 	g_LastAcceptedVolumeVk = vkKey;
 	g_LastAcceptedVolumeTick = now;
-	tracelog(L"Volume %s accepted: vk=0x%02X\n", source, vkKey);
-	SetKbdHistoryIndex(vkKey);
+	if (UpdateSequenceProgress(vkKey)) {
+		CompleteLockSequence();
+	}
 }
 
 void HandleKeyboardRawVolumeInput(const RAWKEYBOARD& keyboard) {
@@ -1399,9 +1085,6 @@ void HandleKeyboardRawVolumeInput(const RAWKEYBOARD& keyboard) {
 
 	bool* keyDownState = keyboard.VKey == VK_VOLUME_UP ? &g_KeyboardVolumeUpDown : &g_KeyboardVolumeDownDown;
 	if (keyboard.Message == WM_KEYUP || keyboard.Message == WM_SYSKEYUP) {
-		if (*keyDownState) {
-			tracelog(L"Volume keyboard raw release: vk=0x%02X\n", keyboard.VKey);
-		}
 		*keyDownState = false;
 		return;
 	}
@@ -1411,12 +1094,11 @@ void HandleKeyboardRawVolumeInput(const RAWKEYBOARD& keyboard) {
 	}
 
 	if (*keyDownState) {
-		tracelog(L"Volume keyboard raw held repeat suppressed: vk=0x%02X\n", keyboard.VKey);
 		return;
 	}
 
 	*keyDownState = true;
-	HandleVolumeKeyEvent(keyboard.VKey, L"keyboard raw input");
+	HandleVolumeKeyEvent(keyboard.VKey);
 }
 
 LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -1438,7 +1120,7 @@ LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 				else {
 					DWORD vkKey = 0;
 					if (TryGetVolumeKeyFromConsumerHid(eventInfo, vkKey)) {
-						HandleVolumeKeyEvent(vkKey, L"consumer HID input");
+						HandleVolumeKeyEvent(vkKey);
 					}
 				}
 			}
@@ -1466,11 +1148,11 @@ LRESULT CALLBACK pWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	else if (uMsg == WM_APPCOMMAND) {
 		const int command = GET_APPCOMMAND_LPARAM(lParam);
 		if (command == APPCOMMAND_VOLUME_UP) {
-			HandleVolumeKeyEvent(VK_VOLUME_UP, L"app command");
+			HandleVolumeKeyEvent(VK_VOLUME_UP);
 			return TRUE;
 		}
 		if (command == APPCOMMAND_VOLUME_DOWN) {
-			HandleVolumeKeyEvent(VK_VOLUME_DOWN, L"app command");
+			HandleVolumeKeyEvent(VK_VOLUME_DOWN);
 			return TRUE;
 		}
 	}
@@ -1500,9 +1182,6 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	if (RegisterClassEx(&wx)) {
 		hWnd = CreateWindowEx(0, winClassName, L"IOInptWin", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, wx.hInstance, NULL);
 	}
-	else {
-		tracelog(L"RegisterClassEx raw input failed: %d\n", GetLastError());
-	}
 
 	RAWINPUTDEVICE Rid[2]; // keyboard plus HID consumer-control devices
 	Rid[0].usUsagePage = HID_USAGE_PAGE_GENERIC;
@@ -1513,25 +1192,10 @@ DWORD WINAPI InputEventThread(LPVOID lpParameter) {
 	Rid[1].usUsage = HidConsumerControlUsage;
 	Rid[1].dwFlags = RIDEV_INPUTSINK;
 	Rid[1].hwndTarget = hWnd;
-	if (!hWnd) {
-		tracelog(L"Raw input window creation failed: %d\n", GetLastError());
-	}
-	else {
-		g_MessageWindow = hWnd;
+	if (hWnd) {
 		AddTrayIcon(hWnd);
-
-		if (!RegisterRawInputDevices(Rid, 2, sizeof(Rid[0]))) {
-			tracelog(L"RegisterRawInputDevices failed: %d\n", GetLastError());
-		}
-		else {
-			tracelog(L"Raw input registered on hidden window for keyboard and consumer controls.\n");
-		}
+		RegisterRawInputDevices(Rid, 2, sizeof(Rid[0]));
 	}
-
-#ifdef _DEBUG
-	ShowSequenceOverlay(4, true);
-	tracelog(L"Debug startup overlay pulse requested.\n");
-#endif
 
 	MSG msg;
 	while (GetMessage(&msg, NULL, 0, 0)) {
@@ -1552,7 +1216,6 @@ bool CheckIfAlreadyRunning() {
 	static HANDLE hMutex = NULL;
 	hMutex = CreateMutex(NULL, TRUE, L"Global\\SAGE_LOCK_INSTANCE");
 	if (!hMutex) {
-		tracelog(L"CreateMutex failed: %s", GetLastErrorAsWString().c_str());
 		return false;
 	}
 
@@ -1571,21 +1234,16 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 	UNREFERENCED_PARAMETER(nShowCmd);
 
 	g_hInstance = hInstance;
-	tracelog(L"SageLock starting. ExecutableDir=%s\n", GetExecutableDir().c_str());
 
 	if (CheckIfAlreadyRunning()) {
-		tracelog(L"SageLock startup blocked: another instance is already running.\n");
 		MessageBoxW(NULL, L"SageLock is already running", L"SageLock", MB_OK | MB_ICONERROR);
 		return 0;
 	}
 
-	tracelog(L"SageLock startup target enumeration begins.\n");
 	RefreshTouchDeviceIdsFromHidCaps();
-	tracelog(L"SageLock startup target enumeration complete.\n");
 
 	HANDLE hInputThread = CreateThread(NULL, NULL, InputEventThread, NULL, NULL, NULL);
 	if (!hInputThread) {
-		tracelog(L"CreateThread failed: %s", GetLastErrorAsWString().c_str());
 		return 1;
 	}
 
